@@ -12,6 +12,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from collections import defaultdict
+from pathlib import Path
 import time, warnings
 warnings.filterwarnings('ignore')
 
@@ -37,46 +38,56 @@ plt.rcParams.update({
 # ─────────────────────────────────────────────
 # 1.  LOAD DATASET
 # ─────────────────────────────────────────────
-def load_graph(path):
-    """Parse edge-list file; return (edges, node set)."""
-    edges, nodes = [], set()
-    with open(path) as f:
+def build_sparse_stochastic_from_file(path):
+    """
+    Build the column-stochastic hyperlink matrix S (scipy CSC) directly from file.
+    Uses a two-pass construction to remain memory efficient on large edge lists.
+
+    Dangling columns are handled during iteration, not embedded in S.
+    Returns S (n×n CSC), node_to_idx dict, idx_to_node list, non-self edge count.
+    """
+    path = Path(path)
+    nodes = set()
+    out_deg = defaultdict(int)
+    m_nonself = 0
+
+    # First pass: discover node set, out-degree, and valid edge count.
+    with path.open() as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
             u, v = map(int, line.split())
-            edges.append((u, v))
             nodes.update([u, v])
-    return edges, sorted(nodes)
+            if u != v:
+                out_deg[u] += 1
+                m_nonself += 1
 
-
-def build_sparse_stochastic(edges, nodes):
-    """
-    Build the column-stochastic hyperlink matrix S (scipy CSC).
-    Dangling columns → uniform 1/n column.
-    Returns S (n×n CSC), node_to_idx dict, idx_to_node list.
-    """
+    nodes = sorted(nodes)
     n2i = {v: i for i, v in enumerate(nodes)}
-    n   = len(nodes)
 
-    # Count out-degree
-    out_deg = defaultdict(int)
-    for u, v in edges:
-        if u != v:                 # ignore self-loops
-            out_deg[u] += 1
+    # Second pass: fill sparse triplets with pre-allocated arrays.
+    rows = np.empty(m_nonself, dtype=np.int32)
+    cols = np.empty(m_nonself, dtype=np.int32)
+    data = np.empty(m_nonself, dtype=np.float64)
 
-    rows, cols, data = [], [], []
-    for u, v in edges:
-        if u == v:
-            continue
-        i, j = n2i[v], n2i[u]    # column j points TO row i
-        rows.append(i)
-        cols.append(j)
-        data.append(1.0 / out_deg[u])
+    k = 0
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            u, v = map(int, line.split())
+            if u == v:
+                continue
+            rows[k] = n2i[v]               # column j points TO row i
+            cols[k] = n2i[u]
+            data[k] = 1.0 / out_deg[u]
+            k += 1
 
+    n = len(nodes)
     S = sp.csc_matrix((data, (rows, cols)), shape=(n, n))
-    return S, n2i, nodes
+    return S, n2i, nodes, m_nonself
 
 
 # ─────────────────────────────────────────────
@@ -297,7 +308,7 @@ def fig2_method_comparison(out_dir):
 # ─────────────────────────────────────────────
 # FIGURE 3: Large-graph (10k) power iteration
 # ─────────────────────────────────────────────
-def fig3_large_graph(S, nodes, r_power, history, n_iters, elapsed, out_dir):
+def fig3_large_graph(S, nodes, r_power, history, n_iters, elapsed, out_dir, dataset_name):
     n = len(nodes)
     ranks = np.argsort(r_power)[::-1]
     top_k = 15
@@ -309,7 +320,7 @@ def fig3_large_graph(S, nodes, r_power, history, n_iters, elapsed, out_dir):
     ax.semilogy(history, color=BLUE, lw=2)
     ax.axhline(1e-10, color=RED, ls='--', lw=1, label="Tolerance 1e-10")
     ax.set_xlabel("Iteration"); ax.set_ylabel("L1 Residual")
-    ax.set_title(f"Power-Iteration Convergence\nweb-Google_10k.txt (n={n:,}, {n_iters} iters, {elapsed:.1f}s)", fontweight='bold')
+    ax.set_title(f"Power-Iteration Convergence\n{dataset_name} (n={n:,}, {n_iters} iters, {elapsed:.1f}s)", fontweight='bold')
     ax.legend(fontsize=8)
 
     # B: top-k bar
@@ -321,7 +332,7 @@ def fig3_large_graph(S, nodes, r_power, history, n_iters, elapsed, out_dir):
     ax.set_yticks(range(top_k-1, -1, -1))
     ax.set_yticklabels([f"Node {v}" for v in top_ids], fontsize=7)
     ax.set_xlabel("PageRank Score")
-    ax.set_title(f"Top-{top_k} Pages by PageRank\n(web-Google_10k.txt)", fontweight='bold')
+    ax.set_title(f"Top-{top_k} Pages by PageRank\n({dataset_name})", fontweight='bold')
 
     # C: score distribution (log-log)
     ax = axes[2]
@@ -533,7 +544,7 @@ def fig5_crawler(out_dir):
 # ─────────────────────────────────────────────
 # FIGURE 6: p-sensitivity on large graph
 # ─────────────────────────────────────────────
-def fig6_large_p_sensitivity(S, nodes, out_dir):
+def fig6_large_p_sensitivity(S, nodes, out_dir, dataset_name):
     p_vals  = [0.05, 0.15, 0.30, 0.50, 0.85]
     results = {}
     for p in p_vals:
@@ -548,7 +559,7 @@ def fig6_large_p_sensitivity(S, nodes, out_dir):
         sorted_r = np.sort(results[p])[::-1][:500]
         ax.semilogy(np.arange(1, 501), sorted_r, lw=2, label=f"p={p}")
     ax.set_xlabel("Rank (top 500)"); ax.set_ylabel("PageRank Score (log)")
-    ax.set_title("Top-500 Score Profiles for Different p\n(web-Google_10k.txt)", fontweight='bold')
+    ax.set_title(f"Top-500 Score Profiles for Different p\n({dataset_name})", fontweight='bold')
     ax.legend(fontsize=8)
 
     ax2 = axes[1]
@@ -824,12 +835,22 @@ def fig7_trustchain(out_dir):
 # MAIN
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    import argparse
     import os
-    from pathlib import Path
 
     base_dir = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description="SC4052 Q6 PageRank analysis")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=str(base_dir / "data" / "web-Google.txt"),
+        help="Path to edge-list dataset (default: data/web-Google.txt)",
+    )
+    args = parser.parse_args()
+
     out_dir = base_dir / "outputs"
-    data_path = base_dir / "data" / "web-Google_10k.txt"
+    data_path = Path(args.dataset)
+    dataset_name = data_path.name
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -849,11 +870,10 @@ if __name__ == "__main__":
     p2, l1_toy, l2_toy, linf_toy, iters_toy = fig2_method_comparison(out_dir)
 
     # ── Load large graph
-    print("[3/6] Loading web-Google_10k.txt...")
-    edges, nodes = load_graph(data_path)
-    S, n2i, node_list = build_sparse_stochastic(edges, nodes)
+    print(f"[3/6] Loading {dataset_name}...")
+    S, n2i, node_list, edge_count = build_sparse_stochastic_from_file(data_path)
     n = len(node_list)
-    print(f"      Nodes: {n:,}  Edges: {len(edges):,}  Matrix nnz: {S.nnz:,}")
+    print(f"      Nodes: {n:,}  Edges: {edge_count:,}  Matrix nnz: {S.nnz:,}")
 
     # ── Power iteration on large graph
     print("      Running power iteration...")
@@ -862,7 +882,7 @@ if __name__ == "__main__":
 
     # ── Fig 3: large graph results
     print("[4/6] Generating large-graph figure...")
-    p3 = fig3_large_graph(S, node_list, r_power, history, n_iters, elapsed, out_dir)
+    p3 = fig3_large_graph(S, node_list, r_power, history, n_iters, elapsed, out_dir, dataset_name)
 
     # ── Fig 4: sub-graph closed-form vs Jacobi
     print("[5/6] Generating sub-graph comparison figure...")
@@ -874,7 +894,7 @@ if __name__ == "__main__":
 
     # ── Fig 6: p sensitivity large graph
     print("[6b/6] Generating large-graph p-sensitivity figure...")
-    p6 = fig6_large_p_sensitivity(S, node_list, out_dir)
+    p6 = fig6_large_p_sensitivity(S, node_list, out_dir, dataset_name)
 
     # ── Fig 7: TrustChain PageRank extension
     print("[7/7] Generating TrustChain PageRank figure...")
@@ -895,8 +915,8 @@ if __name__ == "__main__":
     print(f"  L∞ error:   {linf_sub:.3e}")
     print(f"  Iterations: {iters_sub}")
 
-    print(f"\n[Large graph – web-Google_10k.txt]")
-    print(f"  Nodes: {n:,}, Edges: {len(edges):,}")
+    print(f"\n[Large graph – {dataset_name}]")
+    print(f"  Nodes: {n:,}, Edges: {edge_count:,}")
     print(f"  Power iteration: {n_iters} iters, {elapsed:.2f}s")
     top5 = np.argsort(r_power)[::-1][:5]
     print("  Top-5 nodes:")
